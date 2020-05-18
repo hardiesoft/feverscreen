@@ -268,6 +268,7 @@ func Run() error {
 	apiRouter.HandleFunc("/camera/snapshot", apiObj.TakeSnapshot).Methods("PUT")
 	apiRouter.HandleFunc("/camera/snapshot-raw", apiObj.TakeRawSnapshot).Methods("PUT")
 	apiRouter.HandleFunc("/camera/metadata", apiObj.FrameMetadata).Methods("GET")
+	apiRouter.HandleFunc("/camera/run-ffc", apiObj.RunFFC).Methods("PUT")
 	apiRouter.HandleFunc("/signal-strength", apiObj.GetSignalStrength).Methods("GET")
 	apiRouter.HandleFunc("/reregister", apiObj.Reregister).Methods("POST")
 	apiRouter.HandleFunc("/reboot", apiObj.Reboot).Methods("POST")
