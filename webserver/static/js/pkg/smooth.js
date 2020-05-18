@@ -84,11 +84,59 @@ function addBorrowedObject(obj) {
 }
 /**
 * @param {any} input_frame
-* @returns {any}
 */
 export function smooth(input_frame) {
     try {
-        var ret = wasm.smooth(addBorrowedObject(input_frame));
+        wasm.smooth(addBorrowedObject(input_frame));
+    } finally {
+        heap[stack_pointer++] = undefined;
+    }
+}
+
+/**
+* @returns {any}
+*/
+export function get_median_smoothed() {
+    var ret = wasm.get_median_smoothed();
+    return takeObject(ret);
+}
+
+/**
+* @returns {any}
+*/
+export function get_radial_smoothed() {
+    var ret = wasm.get_radial_smoothed();
+    return takeObject(ret);
+}
+
+/**
+* @returns {any}
+*/
+export function get_edges() {
+    var ret = wasm.get_edges();
+    return takeObject(ret);
+}
+
+/**
+* @param {any} input_frame
+* @returns {any}
+*/
+export function median_smooth(input_frame) {
+    try {
+        var ret = wasm.median_smooth(addBorrowedObject(input_frame));
+        return takeObject(ret);
+    } finally {
+        heap[stack_pointer++] = undefined;
+    }
+}
+
+/**
+* @param {any} input_frame
+* @returns {any}
+*/
+export function radial_smooth(input_frame) {
+    try {
+        var ret = wasm.radial_smooth(addBorrowedObject(input_frame));
         return takeObject(ret);
     } finally {
         heap[stack_pointer++] = undefined;
