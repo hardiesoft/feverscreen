@@ -143,6 +143,81 @@ export function radial_smooth(input_frame) {
     }
 }
 
+/**
+* @param {number} width
+* @param {number} height
+* @returns {CircleDetect}
+*/
+export function circle_detect(width, height) {
+    var ret = wasm.circle_detect(width, height);
+    return CircleDetect.__wrap(ret);
+}
+
+/**
+*/
+export class CircleDetect {
+
+    static __wrap(ptr) {
+        const obj = Object.create(CircleDetect.prototype);
+        obj.ptr = ptr;
+
+        return obj;
+    }
+
+    free() {
+        const ptr = this.ptr;
+        this.ptr = 0;
+
+        wasm.__wbg_circledetect_free(ptr);
+    }
+    /**
+    * @returns {number}
+    */
+    r() {
+        var ret = wasm.circledetect_r(this.ptr);
+        return ret >>> 0;
+    }
+    /**
+    * @returns {Point}
+    */
+    p() {
+        var ret = wasm.circledetect_p(this.ptr);
+        return Point.__wrap(ret);
+    }
+}
+/**
+*/
+export class Point {
+
+    static __wrap(ptr) {
+        const obj = Object.create(Point.prototype);
+        obj.ptr = ptr;
+
+        return obj;
+    }
+
+    free() {
+        const ptr = this.ptr;
+        this.ptr = 0;
+
+        wasm.__wbg_point_free(ptr);
+    }
+    /**
+    * @returns {number}
+    */
+    x() {
+        var ret = wasm.point_x(this.ptr);
+        return ret >>> 0;
+    }
+    /**
+    * @returns {number}
+    */
+    y() {
+        var ret = wasm.point_y(this.ptr);
+        return ret >>> 0;
+    }
+}
+
 function init(module) {
     if (typeof module === 'undefined') {
         module = import.meta.url.replace(/\.js$/, '_bg.wasm');

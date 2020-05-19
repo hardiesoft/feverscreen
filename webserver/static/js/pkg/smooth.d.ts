@@ -31,6 +31,38 @@ export function median_smooth(input_frame: any): any;
 * @returns {any} 
 */
 export function radial_smooth(input_frame: any): any;
+/**
+* @param {number} width 
+* @param {number} height 
+* @returns {CircleDetect} 
+*/
+export function circle_detect(width: number, height: number): CircleDetect;
+/**
+*/
+export class CircleDetect {
+  free(): void;
+/**
+* @returns {number} 
+*/
+  r(): number;
+/**
+* @returns {Point} 
+*/
+  p(): Point;
+}
+/**
+*/
+export class Point {
+  free(): void;
+/**
+* @returns {number} 
+*/
+  x(): number;
+/**
+* @returns {number} 
+*/
+  y(): number;
+}
 
 /**
 * If `module_or_path` is {RequestInfo}, makes a request and

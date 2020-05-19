@@ -3,6 +3,7 @@ import {fahrenheitToCelsius, moduleTemperatureAnomaly, sensorAnomaly, ROIFeature
 import {DeviceApi} from "./api.js";
 import {CalibrationInfo, FrameInfo, Modes, NetworkInterface, TemperatureSource} from "./feverscreen-types.js";
 import {buildSAT, scanHaar, ConvertCascadeXML, HaarCascade} from "./haarcascade.js";
+import {CircleDetect} from "./pkg/smooth";
 
 let GROI : ROIFeature[] = [];
 const GSensor_response = 0.030117;
@@ -105,12 +106,13 @@ function LoadCascadeXML() {
 
 // Top of JS
 window.onload = async function() {
-  const ImageSmoothingWasm = ((window as any).ImageSmoothingWasm as any);
+  const ImageSmoothingWasm = ((window as any).ImageSmoothingWasm);
   ImageSmoothingWasm.initialize(160, 120);
   let smooth: (arr: Float32Array) => Float32Array = ImageSmoothingWasm.smooth;
   let get_radial_smoothed: () => Float32Array = ImageSmoothingWasm.get_radial_smoothed;
   let get_median_smoothed: () => Float32Array = ImageSmoothingWasm.get_median_smoothed;
   let get_edges: () => Float32Array = ImageSmoothingWasm.get_edges;
+  let circle_detect: (width: number, height: number) => CircleDetect = ImageSmoothingWasm.circle_detect;
   LoadCascadeXML();
 
   let GCalibrate_temperature_celsius = 37;
@@ -828,6 +830,7 @@ window.onload = async function() {
         source: Float32Array, dest: Float32Array, radius: number, width: number, height: number,
         wx0 : number, wy0 : number, wx1 : number, wy1 : number
         ): number[] {
+    performance.mark('cdr start');
     radius=Math.max(radius,0.00001)
     for(let i=0; i<width * height; i++) {
         dest[i] = 0;
@@ -859,10 +862,13 @@ window.onload = async function() {
         }
       }
     }
+    performance.mark('cdr end');
+    performance.measure('circleDetectRadius', 'cdr start', 'cdr end');
     return [result/(2+radius), rx, ry];
   }
 
-  function circleDetect(source: Float32Array): [Float32Array, number, number, number] {
+  function circleDetect(source: Float32Array): [number, number, number] {
+    performance.mark('cd start');
     const width = frameWidth;
     const height = frameHeight;
     const dest = new Float32Array(width * height);
@@ -887,7 +893,9 @@ window.onload = async function() {
     }
 
     //circleDetectRadius(source, dest, bestRadius, width, height);
-    return [dest, bestRadius, bestX, bestY];
+    performance.mark('cd end');
+    performance.measure('cd', 'cd start', 'cd end');
+    return [bestRadius, bestX, bestY];
   }
 
   function mip_scale_down(source: Float32Array, width: number, height: number): Float32Array {
@@ -949,7 +957,7 @@ window.onload = async function() {
     for(let i=0; i<wh; i++) {
       let value = source[i];
       if(value<0 || 10000<value) {
-        console.log('superhot value '+value);
+        //console.log('superhot value '+value);
         continue;
       }
       GMipScale1[i] += 1;
@@ -1026,11 +1034,12 @@ window.onload = async function() {
     const y0 = ~~r.y0;
     const x1 = ~~r.x1;
     const y1 = ~~r.y1;
-    let sv_raw = []
+    let sv_raw = new Float32Array((x1-x0) * (y1-y0));
+    let i = 0;
     for(let y = y0; y<y1; y++) {
       for(let x = x0; x<x1; x++) {
         let index = y * width + x;
-        sv_raw.push(source[index])
+        sv_raw[i++] = source[index];
       }
     }
     sv_raw.sort()
@@ -1111,9 +1120,15 @@ window.onload = async function() {
     return true;
   }
 
+  let saveNextFrame = false;
+  function saveScreen() {
+    saveNextFrame = true;
+  }
+  (window as any).saveScreen = saveScreen;
+
   function detectThermalReference(roi : ROIFeature[], saltPepperData: Float32Array, smoothedData: Float32Array, width : number, height : number) {
  //   const edgeData = edgeDetect(saltPepperData);
-    const edgeData = edgeDetect(smoothedData);
+    const edgeData = get_edges();
 
     if(GROI.length>0) {
         let prevTherm = GROI[GROI.length-1];
@@ -1124,11 +1139,17 @@ window.onload = async function() {
         }
     }
 
-    let circle_image;
-    let bestRadius;
-    let bestX;
-    let bestY;
-    [circle_image, bestRadius, bestX, bestY] = circleDetect(edgeData);
+    performance.mark('cd start');
+
+    // NOTE(jon): Interestingly, it cam be slower doing this in wasm, but is more consistent with less spikes.
+    //const circle = circle_detect(width, height);
+    // const bestRadius = circle.r();
+    // const circlePos = circle.p();
+    // const bestX = circlePos.x();
+    // const bestY = circlePos.y();
+    let [bestRadius, bestX, bestY] = circleDetect(edgeData);
+    performance.mark('cd end');
+    performance.measure('circle_detect', 'cd start', 'cd end');
 
     if (bestRadius<=0) {
       return roi;
@@ -1140,7 +1161,6 @@ window.onload = async function() {
     r.x1 = bestX + bestRadius;
     r.y1 = bestY + bestRadius;
     r.sensorValue = extractSensorValue(r, saltPepperData, frameWidth, frameHeight);
-
     return insertThermalReference(roi, r);
   }
 
@@ -1177,11 +1197,11 @@ window.onload = async function() {
     //zero knowledge..
     let roi : ROIFeature[] = []
 
-    if(GCascadeFace != null) {
-      const satData = buildSAT(smoothedData, width, height);
-      let roiScan = scanHaar(GCascadeFace, satData, frameWidth, frameHeight);
-      roi = roi.concat(roiScan);
-    }
+    // if(GCascadeFace != null) {
+    //   const satData = buildSAT(smoothedData, width, height);
+    //   let roiScan = scanHaar(GCascadeFace, satData, frameWidth, frameHeight);
+    //   roi = roi.concat(roiScan);
+    // }
 
     roi = detectThermalReference(roi, saltPepperData, smoothedData, width, height);
 
@@ -1197,27 +1217,33 @@ window.onload = async function() {
 
   // TODO(jon): Make this into a pure function, which returns the mutated calibration context.
   function processSnapshotRaw(source: Float32Array, frameInfo: FrameInfo, timeSinceFFC: number) {
-
+    if (saveNextFrame) {
+      saveNextFrame = false;
+      const blobUrl = URL.createObjectURL(new Blob([source]));
+      const link = document.createElement("a"); // Or maybe get it from the current document
+      link.href = blobUrl;
+      link.download = "edges_raw";
+      link.innerHTML = "Click here to download the file";
+      (document.getElementById('main-inner') as HTMLElement).appendChild(link);
+    }
+    performance.mark('sm start');
     smooth(source);
-
+    performance.mark('sm end');
+    performance.measure('smoothing', 'sm start', 'sm end');
     {
       //Spatial preprocessing of the data...
 
       //First use a salt'n'pepper median filter
       // https://en.wikipedia.org/wiki/Shot_noise
-      const s = performance.now();
       const saltPepperData = get_median_smoothed();
-      const s1 = performance.now();
-      console.log('median_smooth', s1 - s);
-
       //next, a radial blur, this averages out surrounding pixels, trading accuracy for effective resolution
       const smoothedData = get_radial_smoothed();
-      const s2 = performance.now();
-      console.log('radial_smooth', s2 - s1);
-      source = smoothedData;
+
+      performance.mark('fd start');
       featureDetect(saltPepperData, smoothedData, frameWidth, frameHeight);
-      const s3 = performance.now();
-      console.log(s3 - s2);
+      performance.mark('fd end');
+      performance.measure('feature detection', 'fd start', 'fd end');
+      source = smoothedData;//get_edges();
     }
 
     GDevice_temperature = frameInfo.Telemetry.TempC;
@@ -1564,10 +1590,6 @@ window.onload = async function() {
       retrySocket(5, deviceIp);
     });
 
-    const frames: Frame[] = [];
-    let msPerFrame = 1000 / 9;
-    let pendingFrame: undefined | number = undefined;
-
     interface Frame {
       frameInfo: FrameInfo;
       frame: Float32Array;
@@ -1595,55 +1617,10 @@ window.onload = async function() {
       return null;
     }
 
-    async function useLatestFrame() {
-      if (pendingFrame) {
-        clearTimeout(pendingFrame);
-      }
-      let latestFrameTimeOnMs = 0;
-      let latestFrame: Frame | null = null;
-      // Turns out that we don't always get the messages in order from the pi, so make sure we take the latest one.
-      const framesToDrop: Frame[] = [];
-      while (frames.length !== 0) {
-        const frame = frames.shift() as Frame;
-        const frameHeader = frame.frameInfo;
-        if (frameHeader !== null) {
-          const timeOn = frameHeader.Telemetry.TimeOn / 1000 / 1000;
-          if (timeOn > latestFrameTimeOnMs) {
-            if (latestFrame !== null) {
-              framesToDrop.push(latestFrame);
-            }
-            latestFrameTimeOnMs = timeOn;
-            latestFrame = frame;
-          }
-        }
-      }
-      // Clear out and log any old frames that need to be dropped
-      while (framesToDrop.length !== 0) {
-        const dropFrame = framesToDrop.shift() as Frame;
-        const timeOn = dropFrame.frameInfo.Telemetry.TimeOn / 1000 / 1000;
-        socket.send(JSON.stringify({
-          type: "Dropped late frame",
-          data: `${latestFrameTimeOnMs - timeOn}ms behind current: frame#${dropFrame.frameInfo.Telemetry.FrameCount}`,
-          uuid: UUID,
-        }));
-      }
-
-      // Take the latest frame and process it.
-      if (latestFrame !== null) {
-        await updateFrame(latestFrame.frame, latestFrame.frameInfo);
-      }
-    }
-
-    let lst = 0;
     socket.addEventListener('message', async (event) => {
-      console.log('time elapsed since last message', event.timeStamp - lst);
-      lst = event.timeStamp;
       if (event.data instanceof Blob) {
-        frames.push(await parseFrame(event.data as Blob) as Frame);
-        // Process the latest frame, after waiting half a frame delay
-        // to see if there are any more frames hot on its heels.
-        //clearTimeout(pendingFrame);
-        pendingFrame = setTimeout(useLatestFrame, 35);
+        const {frame, frameInfo} = await parseFrame(event.data as Blob) as Frame;
+        await updateFrame(frame, frameInfo)
       } else {
         // Let's try and get our data as json:
         // This might be status about the initial load of the device, connection, whether we need to ask the
@@ -1813,10 +1790,15 @@ window.onload = async function() {
     }
     const exitingFFC = GDuringFFC && !(telemetry.FFCState !== "complete" || ffcDelay > 0);
     GDuringFFC = telemetry.FFCState !== "complete" || ffcDelay > 0;
-
-    const start = performance.now();
+    performance.clearMarks();
+    performance.clearMeasures();
+    performance.clearResourceTimings()
+    performance.mark('process start');
     processSnapshotRaw(Float32Array.from(new Uint16Array(data)), frameInfo, GTimeSinceFFC);
-    console.log('processSnapshotRaw', performance.now() - start);
+    performance.mark('process end')
+    performance.measure('processing total', 'process start', 'process end');
+
+    //console.log(performance.getEntriesByType('measure'));
 
     if (GDuringFFC && !exitingFFC) {
       // Disable the 'DONE' button which enables the user to exit calibration.
