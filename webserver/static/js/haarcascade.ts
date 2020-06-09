@@ -54,8 +54,7 @@ export class HaarCascade {
 export function buildSAT(
   source: Float32Array,
   width: number,
-  height: number,
-  sensorCorrection: number
+  height: number
 ): [Float32Array, Float32Array, Float32Array] {
   if (window.SharedArrayBuffer === undefined) {
     // Having the array buffers able to be shared across workers should be faster
@@ -81,8 +80,6 @@ export function buildSAT(
     vMin = Math.min(vMin, source[i]);
     vMax = Math.max(vMax, source[i]);
   }
-  vMin += sensorCorrection;
-  vMax += sensorCorrection;
 
   let rescale = 1; //255/(vMax-vMin);
 
@@ -92,7 +89,7 @@ export function buildSAT(
     for (let x = 0; x <= width; x++) {
       const indexS = Math.min(y, height - 1) * width + Math.min(x, width - 1);
       const indexD = (y + 2) * w2 + (x + 1);
-      const value = (source[indexS] + sensorCorrection - vMin) * rescale;
+      const value = (source[indexS] - vMin) * rescale;
 
       runningSum += value;
       runningSumSq += value * value;
@@ -104,8 +101,7 @@ export function buildSAT(
       tiltValue += destTilt[indexD - w2 - 1];
       tiltValue += destTilt[indexD - w2 + 1];
       if (y > 0) {
-        tiltValue +=
-          (source[indexS - width] + sensorCorrection - vMin) * rescale;
+        tiltValue += (source[indexS - width] - vMin) * rescale;
       }
       destTilt[indexD] = tiltValue;
     }
@@ -119,8 +115,7 @@ export async function scanHaarParallel(
   cascade: HaarCascade,
   satData: Float32Array[],
   frameWidth: number,
-  frameHeight: number,
-  sensorCorrection: number
+  frameHeight: number
 ): Promise<ROIFeature[]> {
   //https://stackoverflow.com/questions/41887868/haar-cascade-for-face-detection-xml-file-code-explanation-opencv
   //https://github.com/opencv/opencv/blob/master/modules/objdetect/src/cascadedetect.hpp

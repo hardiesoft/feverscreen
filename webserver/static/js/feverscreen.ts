@@ -1,10 +1,5 @@
 import { BlobReader } from "./utils.js";
-import {
-  fahrenheitToCelsius,
-  moduleTemperatureAnomaly,
-  ROIFeature,
-  sensorAnomaly,
-} from "./processing.js";
+import { ROIFeature } from "./processing.js";
 import { DeviceApi } from "./api.js";
 import {
   CalibrationInfo,
@@ -21,15 +16,16 @@ import {
 import {
   buildSAT,
   ConvertCascadeXML,
-  scanHaarParallel,
   HaarCascade,
+  scanHaarParallel,
 } from "./haarcascade.js";
-// import { detectForehead, trackFace } from "./forehead-detect.js";
 import { Face, Hotspot } from "./face.js";
 
 const MinFaceAge = 10;
 let GFaces: Face[] = [];
 let GThermalReference: ROIFeature | null = null;
+const NO_THERMAL_REFERENCE = true;
+const ZeroCelsiusInKelvin = 273.15;
 
 // Temp for testing
 let UncorrectedHotspot = 0;
@@ -61,13 +57,9 @@ function toggleDebugGUI() {
     record.style.display = "none";
   }
 }
-let GForeheads: ROIFeature[];
-let GROI: ROIFeature[] = [];
 const ForeheadColour = "#00ff00";
 const GSensor_response = 0.030117;
-const GDevice_sensor_temperature_response = -30.0;
-
-var GThermalRefTemp = 38;
+let GThermalRefTemp = 38;
 
 // NOTE: These are temperature offsets from a forehead measurement.
 const TemperatureOffsetArmpit = 0.0;
@@ -87,8 +79,6 @@ let appVersion: string;
 const isReferenceDevice = () =>
   window.navigator.userAgent ===
   "Mozilla/5.0 (Linux; Android 9; Lenovo TB-X605LC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36";
-
-const staleCalibrationTimeoutMinutes = 60;
 
 // Global sound instance we need to have called .play() on inside a user interaction to be able to use it to play
 // sounds later on iOS safari.
@@ -173,7 +163,7 @@ type FovBox = Record<BoxOffset, number>;
 let GCascadeFace: HaarCascade | null = null;
 
 function download(dataurl: string) {
-  var a = document.createElement("a");
+  const a = document.createElement("a");
   a.href = dataurl;
   a.setAttribute("download", dataurl);
   a.click();
@@ -196,8 +186,6 @@ window.onload = async function () {
   toggleDebugGUI();
   let GCalibrateTemperatureCelsius = 37;
   let GCalibrateSnapshotValue = 0;
-  let GCalibrateThermalRefValue = 0;
-  let GCurrentThermalRefValue = 0;
   let GCalibrateSnapshotTime = 0;
 
   let GCalibrate_body_location: TemperatureSource = TemperatureSource.FOREHEAD;
@@ -216,13 +204,9 @@ window.onload = async function () {
   const thresholdColdBelowNormal = 5; // If threshold normal changes, adjust threshold cold to be 5 degrees below that.
   let GThreshold_cold = 32.5;
   let GDisplay_precision = 1;
-
   let GStable_correction = 0;
-
   let GTimeSinceFFC = 0;
   let GDuringFFC = false;
-
-  let GCurrent_hot_value = 10;
 
   let prevOverlayMessages: string[] = [""];
 
@@ -370,7 +354,7 @@ window.onload = async function () {
     "click",
     async (e) => {
       const btn = e.target as HTMLInputElement;
-      const status = await recordingStatus();
+      const status = await DeviceApi.recorderStatus();
       if (!status.processor) {
         console.log("No processor");
         btn.innerText = status.recording ? "Stop Recording" : "Start Recording";
@@ -423,15 +407,11 @@ window.onload = async function () {
   setTitle("Loading");
 
   async function setRecordStatus(): Promise<any> {
-    const recStatus = await recordingStatus();
+    const recStatus = await DeviceApi.recorderStatus();
     const recordBtn = document.getElementById("record-btn") as HTMLInputElement;
     recordBtn.innerText = recStatus.recording
       ? "Stop Recording"
       : "Start Recording";
-  }
-
-  async function recordingStatus(): Promise<any> {
-    return DeviceApi.getJSON("/recorderstatus");
   }
 
   function onResizeViewport(e: Event | undefined = undefined) {
@@ -680,12 +660,7 @@ window.onload = async function () {
 
   temperatureInputCelsius.addEventListener("input", (event) => {
     let entry_value = parseFloat((event.target as HTMLInputElement).value);
-    if (entry_value < 75) {
-      temperatureInputLabel.innerHTML = "&deg;C";
-    } else {
-      temperatureInputLabel.innerHTML = "&deg;F";
-      entry_value = fahrenheitToCelsius(entry_value);
-    }
+    temperatureInputLabel.innerHTML = "&deg;C";
     setCalibrateTemperature(entry_value, temperatureInputCelsius);
   });
 
@@ -806,20 +781,10 @@ window.onload = async function () {
         "<br>DispTemp:" +
         temperature_celsius.toFixed(GDisplay_precision) +
         "&deg;C";
-      strDisplay += "<br>HotVal  :" + (GCurrent_hot_value / 100).toFixed(3);
       strDisplay +=
         "<br>DevTemp :" +
         frameInfo.Telemetry.TempC.toFixed(GDisplay_precision) +
         "&deg;C";
-      strDisplay +=
-        "<br>SensAnom:" + (sensorAnomaly(GTimeSinceFFC) / 100).toFixed(3);
-      strDisplay += "<br>StabCorr:" + (GStable_correction / 100).toFixed(3);
-      strDisplay +=
-        "<br>TRefCorr:" +
-        ((GCalibrateThermalRefValue - GCurrentThermalRefValue) / 100).toFixed(
-          3
-        );
-
       console.log(strDisplay);
       selectedIcon = undefined;
     }
@@ -849,28 +814,6 @@ window.onload = async function () {
         icon.classList.remove("selected");
       }
     }
-  }
-
-  function estimatedTemperatureForValue(
-    sensorValue: number,
-    sensorCorrection: number
-  ) {
-    return (
-      GCalibrateTemperatureCelsius +
-      (sensorValue + sensorCorrection - GCalibrateSnapshotValue) *
-        GSensor_response
-    );
-  }
-
-  function estimatedValueForTemperature(
-    temperature: number,
-    sensorCorrection: number
-  ) {
-    return (
-      GCalibrateSnapshotValue -
-      sensorCorrection +
-      (temperature - GCalibrateTemperatureCelsius) / GSensor_response
-    );
   }
 
   function setOverlayMessages(...messages: string[]) {
@@ -989,158 +932,7 @@ window.onload = async function () {
   function radial_smooth(source: Float32Array): Float32Array {
     const temp = radial_smooth_half(source, frameWidth, frameHeight);
     // noinspection JSSuspiciousNameCombination
-    const dest = radial_smooth_half(temp, frameHeight, frameWidth);
-    return dest;
-  }
-
-  function mip_scale_down(
-    source: Float32Array,
-    width: number,
-    height: number,
-    correction: number
-  ): Float32Array {
-    const ww = Math.floor(width / 2);
-    const hh = Math.floor(height / 2);
-    const dest = new Float32Array(ww * hh);
-    for (let y = 0; y < hh; y++) {
-      for (let x = 0; x < ww; x++) {
-        const index = y * 2 * width + x * 2;
-        let sumValue = source[index];
-        sumValue += source[index + 1];
-        sumValue += source[index + width];
-        sumValue += source[index + width + 1];
-        dest[y * ww + x] = sumValue / 4 + correction;
-      }
-    }
-    return dest;
-  }
-
-  let GMipScale1: Float32Array | null = null;
-  let GMipScaleX: Float32Array | null = null;
-  let GMipScaleXX: Float32Array | null = null;
-
-  let GMipCorrect1: Float32Array | null = null;
-  let GMipCorrectX: Float32Array | null = null;
-  let GMipCorrectXX: Float32Array | null = null;
-
-  function roll_stable_values() {
-    if (GMipScale1 === null) {
-      return;
-    }
-    GMipCorrect1 = GMipScale1;
-    GMipCorrectX = GMipScaleX;
-    GMipCorrectXX = GMipScaleXX;
-    GMipScale1 = null;
-    GMipScaleX = null;
-    GMipScaleXX = null;
-
-    GStable_correction = 0;
-  }
-
-  function accumulate_stable_temperature(source: Float32Array) {
-    let wh = source.length;
-    if (GMipScale1 === null) {
-      GMipScale1 = new Float32Array(wh);
-      GMipScaleX = new Float32Array(wh);
-      GMipScaleXX = new Float32Array(wh);
-      GMipCorrect1 = null;
-      GMipCorrectX = null;
-      GMipCorrectXX = null;
-    }
-    for (let i = 0; i < wh; i++) {
-      let value = source[i];
-      if (value < 0 || 10000 < value) {
-        //console.log("superhot value " + value);
-        continue;
-      }
-      GMipScale1[i] += 1;
-      (GMipScaleX as Float32Array)[i] += value;
-      (GMipScaleXX as Float32Array)[i] += value * value;
-    }
-  }
-
-  function stable_mean(source: Float32Array) {
-    let i0 = Math.floor(source.length / 4);
-    let i1 = source.length - i0;
-    let sum = 0;
-    let count = 0;
-    for (let i = i0; i < i1; i++) {
-      sum += source[i];
-      count += 1;
-    }
-    return sum / count;
-  }
-
-  function correct_stable_temperature(source: Float32Array) {
-    GStable_correction = 0;
-
-    let mip_1 = GMipCorrect1;
-    let mip_x = GMipCorrectX;
-    let mip_xx = GMipCorrectXX;
-    if (mip_1 === null) {
-      mip_1 = GMipScale1;
-      mip_x = GMipScaleX;
-      mip_xx = GMipScaleXX;
-    }
-
-    if (mip_1 === null) {
-      return;
-    }
-
-    let wh = source.length;
-    let bucket_variation = new Float32Array(wh);
-    let endCursor = 0;
-    for (let index = 0; index < wh; index++) {
-      let value = source[index];
-
-      let exp_1 = mip_1[index];
-      if (exp_1 < 9 * 10) {
-        continue;
-      }
-      let exp_x = (mip_x as Float32Array)[index] / exp_1;
-      let exp_xx = (mip_xx as Float32Array)[index] / exp_1;
-      let inner = Math.max(0, exp_xx - exp_x * exp_x);
-      let std_dev = Math.sqrt(inner);
-      let abs_err = Math.abs(exp_x - value);
-      if (std_dev < 15 && abs_err < 150) {
-        bucket_variation[endCursor++] = exp_x - value;
-      }
-    }
-    if (endCursor < 20) {
-      return;
-    }
-    bucket_variation = bucket_variation.slice(0, endCursor);
-    bucket_variation.sort();
-    GStable_correction = stable_mean(bucket_variation);
-  }
-
-  function extractSensorValue(
-    r: ROIFeature,
-    source: Float32Array,
-    width: number,
-    height: number
-  ) {
-    const x0 = ~~r.x0;
-    const y0 = ~~r.y0;
-    const x1 = ~~r.x1;
-    const y1 = ~~r.y1;
-    let sv_raw = [];
-    for (let y = y0; y < y1; y++) {
-      for (let x = x0; x < x1; x++) {
-        let index = y * width + x;
-        sv_raw.push(source[index]);
-      }
-    }
-    sv_raw.sort();
-    let svrl = sv_raw.length;
-    let i0 = Math.floor(svrl * 0.5);
-    let i1 = Math.floor(svrl * 0.9 + 1);
-    let sv_sum = 0;
-    for (let i = i0; i < i1; i++) {
-      sv_sum += sv_raw[i];
-    }
-    let sv_value = sv_sum / (i1 - i0);
-    return sv_value;
+    return radial_smooth_half(temp, frameHeight, frameWidth);
   }
 
   function pointIsInCircle(
@@ -1192,27 +984,6 @@ window.onload = async function () {
     return sv_sum / sv_raw.length;
   }
 
-  function update_stable_temperature(
-    source: Float32Array,
-    width: number,
-    height: number,
-    sensorCorrection: number
-  ) {
-    while (width > 16) {
-      source = mip_scale_down(source, width, height, sensorCorrection);
-      width = ~~(width / 2);
-      height = ~~(height / 2);
-      sensorCorrection = 0; // only apply once
-    }
-
-    if (GTimeSinceFFC > 120) {
-      accumulate_stable_temperature(source);
-    } else {
-      roll_stable_values();
-    }
-    correct_stable_temperature(source);
-  }
-
   function ExcludedBB(x: number, y: number): boolean {
     if (!GThermalReference) {
       return false;
@@ -1236,14 +1007,12 @@ window.onload = async function () {
   function circleStillPresent(
     r: ROIFeature,
     saltPepperData: Float32Array,
-    edgeData: Float32Array,
-    sensorCorrection: number
+    edgeData: Float32Array
   ) {
     const width = frameWidth;
     const height = frameHeight;
     const dest = new Float32Array(width * height);
     let radius = (r.x1 - r.x0) * 0.5;
-
     let [value, cx, cy] = circleDetectRadius(
       edgeData,
       dest,
@@ -1259,30 +1028,20 @@ window.onload = async function () {
       r.sensorMissing = Math.max(r.sensorMissing - 1, 0);
       return r.sensorMissing > 0;
     }
-    let sensorValue =
-      extractSensorValue(r, saltPepperData, frameWidth, frameHeight) +
-      sensorCorrection;
-    r.sensorValue = lowPassNL(r.sensorValue, sensorValue);
-
-    //Create a low pass filter with a really long half life
-    let halfLife = 2 * (8.7 * 60); //i.e. alpha ^ halfLife = 0.5
-    let alphaLowPass = Math.exp(Math.log(0.5) / halfLife);
-    r.sensorValueLowPass =
-      r.sensorValueLowPass * alphaLowPass + r.sensorValue * (1 - alphaLowPass);
-    r.sensorAge += 1;
+    r.sensorValue = extractSensorValueSlowAndCareful(
+      r,
+      saltPepperData,
+      frameWidth,
+      frameHeight
+    );
     r.sensorMissing = Math.min(r.sensorMissing + 1, 20);
-    if (r.sensorAge > 8.7 * 30) {
-      GCurrentThermalRefValue = r.sensorValueLowPass;
-    }
     return true;
   }
 
   function detectThermalReference(
     saltPepperData: Float32Array,
-    smoothedData: Float32Array,
-    sensorCorrection: number
+    smoothedData: Float32Array
   ): ROIFeature | null {
-    //   const edgeData = edgeDetect(saltPepperData, frameWidth, frameHeight);
     performance.mark("ed start");
     const edgeData = edgeDetect(smoothedData, frameWidth, frameHeight);
     performance.mark("ed end");
@@ -1291,12 +1050,7 @@ window.onload = async function () {
     performance.mark("cd start");
     if (
       GThermalReference &&
-      circleStillPresent(
-        GThermalReference,
-        saltPepperData,
-        edgeData,
-        sensorCorrection
-      )
+      circleStillPresent(GThermalReference, saltPepperData, edgeData)
     ) {
       return GThermalReference;
     }
@@ -1316,10 +1070,12 @@ window.onload = async function () {
     r.y0 = bestY - bestRadius;
     r.x1 = bestX + bestRadius;
     r.y1 = bestY + bestRadius;
-    r.sensorValue =
-      extractSensorValue(r, saltPepperData, frameWidth, frameHeight) +
-      sensorCorrection;
-    r.sensorValueLowPass = r.sensorValue;
+    r.sensorValue = extractSensorValueSlowAndCareful(
+      r,
+      saltPepperData,
+      frameWidth,
+      frameHeight
+    );
 
     UncorrectedThermalRef = extractSensorValueSlowAndCareful(
       r,
@@ -1332,49 +1088,24 @@ window.onload = async function () {
     return r;
   }
 
-  function lowPassNL(x: number, y: number) {
-    if (Math.abs(x - y) > 20) {
-      return y; // Temp change too much for filter.
-    }
-    //Temporal filtering
-    let alpha = 0.3; // Heat up fast
-    if (x > y) {
-      alpha = 0.9; // Cool down slow
-    }
-    return x * alpha + y * (1 - alpha);
-  }
-
   async function featureDetect(
     saltPepperData: Float32Array,
     smoothedData: Float32Array,
-    sensorCorrection: number,
     width: number,
     height: number
   ) {
     //zero knowledge..
     let faces: ROIFeature[] = [];
-
     if (DEBUG_MODE && GCascadeFace != null) {
       performance.mark("buildSat start");
-      const satData = buildSAT(smoothedData, width, height, sensorCorrection);
+      const satData = buildSAT(smoothedData, width, height);
       performance.mark("buildSat end");
       performance.measure("build SAT", "buildSat start", "buildSat end");
-      faces = await scanHaarParallel(
-        GCascadeFace,
-        satData,
-        width,
-        height,
-        sensorCorrection
-      );
+      faces = await scanHaarParallel(GCascadeFace, satData, width, height);
     }
 
     performance.mark("dtr start");
-    GThermalReference = detectThermalReference(
-      saltPepperData,
-      smoothedData,
-      sensorCorrection
-    );
-
+    GThermalReference = detectThermalReference(saltPepperData, smoothedData);
     performance.mark("dtr end");
     performance.measure("detect thermal reference", "dtr start", "dtr end");
 
@@ -1397,7 +1128,7 @@ window.onload = async function () {
         } else {
           face = new Face(haarFace, 0);
           face.trackFace(smoothedData, frameWidth, frameHeight);
-          face.setHotspot(smoothedData, sensorCorrection);
+          face.setHotspot(smoothedData);
           newFaces.push(face);
         }
       }
@@ -1407,7 +1138,7 @@ window.onload = async function () {
         face.trackFace(smoothedData, frameWidth, frameHeight);
         if (face.active()) {
           if (face.tracked()) {
-            face.setHotspot(smoothedData, sensorCorrection);
+            face.setHotspot(smoothedData);
           }
           if (face.haarAge < MinFaceAge && !face.haarActive()) {
             console.log(face);
@@ -1422,19 +1153,32 @@ window.onload = async function () {
     }
   }
 
-  function getStableTempFixAmount() {
-    let stable_fix_factor = 1 - (GTimeSinceFFC - 120) / 60;
-    stable_fix_factor = Math.min(Math.max(stable_fix_factor, 0), 1);
-    return stable_fix_factor * GStable_correction;
-  }
+  const temperatureForSensorValue = (val: number): number => {
+    return GThermalRefTemp + (val - UncorrectedThermalRef) * 0.01;
+  };
+
+  const celsiusToCentiKelvins = (degrees: number): number => {
+    return (ZeroCelsiusInKelvin + degrees) * 100;
+  };
 
   async function processSnapshotRaw(
     sensorData: Float32Array,
-    frameInfo: FrameInfo,
-    timeSinceFFC: number
+    frameInfo: FrameInfo
   ) {
-    // Warning: Order is important in this function, be very careful when moving things around.
+    if (NO_THERMAL_REFERENCE) {
+      // Let's stick a fake thermal reference in:
+      for (let y = 110; y > 70; y--) {
+        for (let x = 10; x < 50; x++) {
+          if (pointIsInCircle(x, y, 17, 100, 4)) {
+            sensorData[y * frameInfo.Camera.ResX + x] = celsiusToCentiKelvins(
+              38
+            );
+          }
+        }
+      }
+    }
 
+    // Warning: Order is important in this function, be very careful when moving things around.
     //Spatial preprocessing of the data...
 
     //First use a salt'n'pepper median filter
@@ -1449,38 +1193,8 @@ window.onload = async function () {
     performance.mark("rsm end");
     performance.measure("radial smoothing", "rsm start", "rsm end");
 
-    let sensorCorrection = 0;
-
-    // In our temperature range, with our particular IR cover,
-    //  an FFC event gives rise to a change in sensor values
-    //  that is mostly time dependent.
-    //Do this first..
-    sensorCorrection -= sensorAnomaly(timeSinceFFC);
-
-    // In our temperature range, once it has warmed up,
-    //  an FFC causes a change in module temperature
-    //  that is mostly time dependent.
-    let device_temperature = frameInfo.Telemetry.TempC;
-    device_temperature -= moduleTemperatureAnomaly(timeSinceFFC);
-
-    // In our temperature range, with our particular IR cover,
-    //  a constant temperature person
-    //  with a change in device temperature,
-    //  changes the sensor values by this amount
-    sensorCorrection +=
-      device_temperature * GDevice_sensor_temperature_response;
-
-    //And update the sensorCorrection
-    sensorCorrection += getStableTempFixAmount();
-
     performance.mark("fd start");
-    const features = await featureDetect(
-      saltPepperData,
-      smoothedData,
-      sensorCorrection,
-      frameWidth,
-      frameHeight
-    );
+    await featureDetect(saltPepperData, smoothedData, frameWidth, frameHeight);
     performance.mark("fd end");
     performance.measure("feature detection", "fd start", "fd end");
 
@@ -1490,12 +1204,9 @@ window.onload = async function () {
     const y0 = Math.floor((frameHeight / 100) * fovBox.top);
     const y1 = frameHeight - Math.floor((frameHeight / 100) * fovBox.bottom);
 
-    //now try to reduce drift from the thermal reference, *AFTER* we've performed the feature detection
-    if (GCalibrateThermalRefValue > 0 && GCurrentThermalRefValue > 0) {
-      sensorCorrection += GCalibrateThermalRefValue - GCurrentThermalRefValue;
-    }
-
+    // Should we make the area to get the hotspot the *union* of the fovBox and any haar area?
     let hotValue = smoothedData[0];
+    let coldValue = 1000000;
     for (let y = y0; y !== y1; y++) {
       for (let x = x0; x !== x1; x++) {
         let index = y * frameWidth + x;
@@ -1508,37 +1219,24 @@ window.onload = async function () {
             hotSpotY = y;
           }
         }
+        if (current < coldValue) {
+          if (!ExcludedBB(x, y)) {
+            coldValue = current;
+          }
+        }
       }
     }
-    hotValue += sensorCorrection;
-
-    GCurrent_hot_value = lowPassNL(GCurrent_hot_value, hotValue);
 
     if (Mode === Modes.CALIBRATE) {
       GCalibrateSnapshotTime = new Date().getTime();
-      GCalibrateSnapshotValue = GCurrent_hot_value;
-      GCalibrateThermalRefValue = GCurrentThermalRefValue;
+      GCalibrateSnapshotValue = UncorrectedHotspot;
     }
 
-    //const temperature = estimatedTemperatureForValue(GCurrent_hot_value, 0);
-    const temperature =
-      GThermalRefTemp + (UncorrectedHotspot - UncorrectedThermalRef) * 0.01;
-    //const temperature = 40
+    const temperature = temperatureForSensorValue(UncorrectedHotspot);
     showTemperature(temperature, frameInfo);
 
-    // Warning: Order is important in this function, be very careful when moving things around.
-
-    let feverThreshold = estimatedValueForTemperature(
-      GThreshold_fever - 0.5,
-      sensorCorrection
-    );
-    let checkThreshold = estimatedValueForTemperature(
-      GThreshold_check - 6.5,
-      sensorCorrection
-    );
-    //let roomThreshold = estimatedValueForTemperature(14.0, sensorCorrection);
-    let roomThreshold = 28804.0;
-    const scaleData = smoothedData;
+    let feverThreshold = 40000;
+    let checkThreshold = 39000;
     let imgData = ctx.createImageData(frameWidth, frameHeight);
 
     for (let index = 0; index < frameWidth * frameHeight; index++) {
@@ -1561,9 +1259,9 @@ window.onload = async function () {
         g = 100 + v;
         b = v;
       } else {
-        let v = (f32Val - roomThreshold) / (checkThreshold - roomThreshold);
+        let v = f32Val - coldValue;
         v = Math.max(v, 0);
-        v = v * v * v * v * 192;
+        //v = v * v * v * v * 192;
         r = v;
         g = v;
         b = v;
@@ -1593,12 +1291,6 @@ window.onload = async function () {
     let scaleX = nativeOverlayWidth / canvasWidth;
     let scaleY = nativeOverlayHeight / frameHeight;
 
-    let sensorCorrectionDriftOnly = 0;
-    if (GCalibrateThermalRefValue > 0 && GCurrentThermalRefValue > 0) {
-      sensorCorrectionDriftOnly +=
-        GCalibrateThermalRefValue - GCurrentThermalRefValue;
-    }
-
     overlayCtx.lineWidth = 3 * window.devicePixelRatio;
     if (GThermalReference) {
       let mx = (GThermalReference.x0 + GThermalReference.x1) * 0.5 * scaleX;
@@ -1623,10 +1315,6 @@ window.onload = async function () {
       let text = "Thermal Ref";
       if (GDisplay_precision > 1) {
         text = "SRef:" + (GThermalReference.sensorValue / 100).toFixed(2);
-        text +=
-          "  SRefLP:" + (GThermalReference.sensorValueLowPass / 100).toFixed(2);
-        //          const temperature = estimatedTemperatureForValue(roi.sensorValue, sensorCorrectionDriftOnly);
-        //          text += ' TRef: '+temperature.toFixed(GDisplay_precision)+" °C";
       }
       overlayCtx.fillText(text, mx, my - mrad - 3);
       overlayCtx.restore();
@@ -1634,13 +1322,7 @@ window.onload = async function () {
 
     for (const face of GFaces) {
       if (face.haarActive()) {
-        drawHaarTracking(
-          face.haarFace,
-          scaleX,
-          scaleY,
-          face.hotspot,
-          sensorCorrectionDriftOnly
-        );
+        drawHaarTracking(face.haarFace, scaleX, scaleY, face.hotspot);
       }
       for (const roi of face.xFeatures) {
         overlayCtx.beginPath();
@@ -1721,8 +1403,7 @@ window.onload = async function () {
     roi: ROIFeature,
     scaleX: number,
     scaleY: number,
-    hotspot: Hotspot,
-    sensorCorrectionDriftOnly: number
+    hotspot: Hotspot
   ) {
     drawTargetCircle(hotspot.sensorX, hotspot.sensorY);
     overlayCtx.beginPath();
@@ -1744,10 +1425,7 @@ window.onload = async function () {
       tx = -roi.x1 * scaleX;
     }
 
-    const temperature = estimatedTemperatureForValue(
-      hotspot.sensorValue,
-      sensorCorrectionDriftOnly
-    );
+    const temperature = temperatureForSensorValue(hotspot.sensorValue);
     let text = "Face, " + temperature.toFixed(GDisplay_precision) + "°C";
     if (GDisplay_precision > 1) {
       text +=
@@ -1800,31 +1478,40 @@ window.onload = async function () {
     setTitle("Calibrate");
   }
 
+  // TODO(jon):
+  // - Only show temperature when we have a person detected in frame.
+  // - Show the temperature of their forehead.
+
   async function startScan(shouldSaveCalibration = true) {
     if (shouldSaveCalibration) {
-      GThermalRefTemp =
-        GCalibrateTemperatureCelsius -
-        (UncorrectedHotspot - UncorrectedThermalRef) * 0.01;
-      await DeviceApi.saveCalibration({
-        ThermalRefTemp: GThermalRefTemp,
-        SnapshotTime: GCalibrateSnapshotTime,
-        TemperatureCelsius: GCalibrateTemperatureCelsius,
-        SnapshotValue: GCalibrateSnapshotValue,
-        SnapshotUncertainty: 0.0,
-        BodyLocation: GCalibrate_body_location,
-        ThresholdMinNormal: GThreshold_normal,
-        ThresholdMinFever: GThreshold_check,
-        Top: fovBox.top,
-        Left: fovBox.left,
-        Right: fovBox.right,
-        Bottom: fovBox.bottom,
-        CalibrationBinaryVersion: binaryVersion,
-        UuidOfUpdater: UUID,
-      });
-      setOverlayMessages("Calibration saved");
+      if (GThermalReference) {
+        GThermalRefTemp =
+          GCalibrateTemperatureCelsius -
+          (UncorrectedHotspot - UncorrectedThermalRef) * 0.01;
+        await DeviceApi.saveCalibration({
+          ThermalRefTemp: GThermalRefTemp,
+          SnapshotTime: GCalibrateSnapshotTime,
+          TemperatureCelsius: GCalibrateTemperatureCelsius,
+          SnapshotValue: GCalibrateSnapshotValue,
+          SnapshotUncertainty: 0.0,
+          BodyLocation: GCalibrate_body_location,
+          ThresholdMinNormal: GThreshold_normal,
+          ThresholdMinFever: GThreshold_check,
+          Top: fovBox.top,
+          Left: fovBox.left,
+          Right: fovBox.right,
+          Bottom: fovBox.bottom,
+          CalibrationBinaryVersion: binaryVersion,
+          UuidOfUpdater: UUID,
+        });
+        setOverlayMessages("Calibration saved");
+
+        calibrationButton.classList.remove("calibrating");
+        settingsDiv.classList.remove("show-calibration");
+      } else {
+        setOverlayMessages("No thermal reference, can't calibrate");
+      }
     }
-    calibrationButton.classList.remove("calibrating");
-    settingsDiv.classList.remove("show-calibration");
     setTimeout(setOverlayMessages, 500);
     setMode(Modes.SCAN);
     setTitle("Scanning...");
@@ -1852,7 +1539,6 @@ window.onload = async function () {
   const framesRendered: number[] = [];
 
   const displayFps = (server: number, client: number) => {
-    const ZeroCelsiusInKelvin = 273.15;
     const now = new Date().getTime();
     if (framesRendered.length !== 0) {
       while (framesRendered.length !== 0 && framesRendered[0] < now - 1000) {
@@ -1861,15 +1547,15 @@ window.onload = async function () {
     }
     fpsCount.innerHTML = `
         ${framesRendered.length} FPS (${server}/${client})<br>
-        ThermalRef: ${~~UncorrectedThermalRef}mK / ${(
+        ThermalRef: ${~~UncorrectedThermalRef}cK / ${(
       UncorrectedThermalRef * 0.01 -
       ZeroCelsiusInKelvin
     ).toFixed(2)}C<br>
-        ThermalRefRange: ${~~UncorrectedThermalRefRange}mK / ${(
+        ThermalRefRange: ${~~UncorrectedThermalRefRange}cK / ${(
       UncorrectedThermalRefRange * 0.01
     ).toFixed(2)}C<br>
         ThermalRefRadius: ${RefRadius}px<br>
-        Hotspot: ${~~UncorrectedHotspot}mK / ${(
+        Hotspot: ${~~UncorrectedHotspot}cK / ${(
       UncorrectedHotspot * 0.01 -
       ZeroCelsiusInKelvin
     ).toFixed(2)}C<br>
@@ -1878,9 +1564,8 @@ window.onload = async function () {
           0.01
         ).toFixed(2)}<br>
         ThermalRefTemp: ${GThermalRefTemp.toFixed(2)}<br>
-        CalculatedTargetTemp: ${(
-          GThermalRefTemp +
-          (UncorrectedHotspot - UncorrectedThermalRef) * 0.01
+        CalculatedTargetTemp: ${temperatureForSensorValue(
+          UncorrectedHotspot
         ).toFixed(2)}
     `;
   };
@@ -2034,7 +1719,6 @@ window.onload = async function () {
         // TODO(jon): If the fps is stable, don't skip frames, for lower latency?
         // const {frame, frameInfo} = await parseFrame(event.data as Blob) as Frame;
         // await updateFrame(frame, frameInfo);
-
         // Only do this if we detect that we're dropping frames?
         frames.push((await parseFrame(event.data as Blob)) as Frame);
         // Process the latest frame, after waiting half a frame delay
@@ -2104,7 +1788,7 @@ window.onload = async function () {
       GThreshold_normal = calibration.ThresholdMinNormal || GThreshold_normal;
       GThreshold_check = calibration.ThresholdMinFever || GThreshold_check;
       GThreshold_cold = GThreshold_normal - thresholdColdBelowNormal;
-
+      console.log("Got Ref Temp", calibration.ThermalRefTemp);
       GThermalRefTemp = calibration.ThermalRefTemp;
 
       (document.getElementById(
@@ -2237,9 +1921,6 @@ window.onload = async function () {
     GTimeSinceFFC =
       (telemetry.TimeOn - telemetry.LastFFCTime) / (1000 * 1000 * 1000);
     let ffcDelay = 5 - GTimeSinceFFC;
-    if (GStable_correction == 0.0) {
-      ffcDelay = 10 - GTimeSinceFFC;
-    }
     const exitingFFC =
       GDuringFFC && !(telemetry.FFCState !== "complete" || ffcDelay > 0);
     GDuringFFC = telemetry.FFCState !== "complete" || ffcDelay > 0;
@@ -2249,8 +1930,7 @@ window.onload = async function () {
     performance.mark("process start");
     await processSnapshotRaw(
       Float32Array.from(new Uint16Array(data)),
-      frameInfo,
-      GTimeSinceFFC
+      frameInfo
     );
     performance.mark("process end");
     performance.measure("processing frame", "process start", "process end");
