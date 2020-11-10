@@ -15,8 +15,8 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 
 use crate::init::{
-    ImageBuffers, BODY_AREA_THIS_FRAME, BODY_SHAPE, FACE, FACE_SHAPE, FRAME_NUM, HAS_BODY, HEIGHT,
-    IMAGE_BUFFERS, MOTION_BIT, MOTION_BUFFER, THERMAL_REF, WIDTH,
+    ImageBuffers, BACKGROUND_BIT, BODY_AREA_THIS_FRAME, BODY_SHAPE, FACE, FACE_SHAPE, FRAME_NUM,
+    HAS_BODY, HEIGHT, IMAGE_BUFFERS, MOTION_BIT, MOTION_BUFFER, THERMAL_REF, WIDTH,
 };
 use crate::shape_processing::{
     clear_body_shape, clear_face_shape, get_neck, guess_approx_head_width,
@@ -88,6 +88,7 @@ impl<'a> Drop for Perf<'a> {
 fn get_threshold_outside_motion(
     motion_shapes: VecDeque<RawShape>,
     radial_smoothed: Img<&[f32]>,
+    min_accumulator: Img<&[f32]>,
 ) -> Option<(f32, f32, f32, Rect, VecDeque<RawShape>, SolidShape)> {
     // Get a convex hull of the motion
     let hull = MultiPoint::from_iter(motion_shapes.iter().flat_map(|shape| {
@@ -180,6 +181,8 @@ fn get_threshold_outside_motion(
             // TODO(jon): If there are no pixels above a higher threshold (32 degrees?), throw them all away,
             //  since it's probably just background noise.
 
+            const LOWER_BOUND: f32 = 30.0;
+            const UPPER_BOUND: f32 = 50.0;
             let mut raw_shapes = VecDeque::with_capacity(motion_hull_shape.len());
             {
                 // This is where we might benefit from better border detection...
@@ -195,10 +198,20 @@ fn get_threshold_outside_motion(
                     // If an edge starts, start a new span, if an edge ends, end the span
                     // and try to assign it to an existing shape, or start a new shape.
                     let mut prev = 0.0;
+                    let mut min_bg_px = 0.0;
                     let mut new_span = None;
                     for (x, &px) in row.iter().enumerate() {
                         highest_temp = f32::max(px, highest_temp);
-                        if px >= threshold && prev < threshold {
+
+                        // Or if the pixel fails the min accumulator test?
+                        // if the pixel isn't over the min_background threshold, continue.
+                        let prev_over_min =
+                            prev - min_bg_px > UPPER_BOUND || min_bg_px - prev > LOWER_BOUND;
+                        min_bg_px = min_accumulator[(x + span.x0 as usize, span.y as usize)];
+                        let over_min = px - min_bg_px > UPPER_BOUND || min_bg_px - px > LOWER_BOUND;
+
+                        if (over_min && !prev_over_min) {
+                            //|| px >= threshold && prev < threshold {
                             // Start a span
                             highest_temp = f32::max(px, highest_temp);
                             new_span = Some(Span {
@@ -206,20 +219,30 @@ fn get_threshold_outside_motion(
                                 x1: x as u8 + 1 + span.x0,
                                 y: span.y,
                             })
-                        } else if px < threshold && prev >= threshold {
+                        } else if (!over_min && prev_over_min) {
+                            //|| (px < threshold && prev >= threshold)
                             // End the current span and assign it.
                             if let Some(mut new_span) = new_span.take() {
                                 new_span.x1 = x as u8 + span.x0;
-                                new_span.assign_to_shape(&mut raw_shapes);
+                                if new_span.width() > 1 {
+                                    new_span.assign_to_shape(&mut raw_shapes);
+                                }
                             }
                         }
                         prev = px;
                     }
-                    if prev >= threshold {
+                    //min_bg_px = min_accumulator[(x - 1, span.y as usize)];
+                    let prev_over_min =
+                        prev - min_bg_px > UPPER_BOUND || min_bg_px - prev > LOWER_BOUND;
+
+                    if prev_over_min {
+                        //|| prev >= threshold {
                         // End the current span and assign it.
                         if let Some(mut new_span) = new_span.take() {
                             new_span.x1 = span.x1;
-                            new_span.assign_to_shape(&mut raw_shapes);
+                            if new_span.width() > 1 {
+                                new_span.assign_to_shape(&mut raw_shapes);
+                            }
                         }
                     }
                 }
@@ -255,10 +278,28 @@ fn get_threshold_outside_motion(
 }
 
 fn keep_shape(shape: &RawShape, radial_smoothed: &Img<&[f32]>) -> bool {
-    if shape.area() < 40 {
-        return false;
-    }
+    // if shape.area() < 40 {
+    //     return false;
+    // }
 
+    //
+    // let mut all_spans_one_wide = true;
+    // 'outer: for spans in &shape.inner {
+    //     if let Some(spans) = spans {
+    //         for span in spans {
+    //             if span.width() > 1 {
+    //                 all_spans_one_wide = false;
+    //                 break 'outer;
+    //             }
+    //         }
+    //     }
+    // }
+    // if all_spans_one_wide {
+    //     return false;
+    // }
+    //
+
+    /*
     let mut min = f32::MAX;
     let mut max = 0.0;
     const NUM_BUCKETS: usize = 16;
@@ -294,6 +335,9 @@ fn keep_shape(shape: &RawShape, radial_smoothed: &Img<&[f32]>) -> bool {
     let dynamic_range = (range / histogram.len() as f32) * useful_dynamic_range as f32;
     // Look at the histogram for each shape, make sure it has enough dynamic range to be considered:
     dynamic_range > 100.0
+
+     */
+    true
 }
 
 fn get_solid_shapes_for_hull(hull: &MultiPolygon<f32>) -> SolidShape {
@@ -360,6 +404,7 @@ fn extract_internal(
     let mut analysis_result = AnalysisResult::default();
     let radial_smoothed = &image_buffers.radial_smoothed.borrow();
     let median_smoothed = &image_buffers.median_smoothed.borrow();
+    let min_accumulator = &image_buffers.min_accumulator.borrow();
     let mask = &mut image_buffers.mask.borrow_mut();
     {
         let _p = Perf::new("Global min/max");
@@ -373,7 +418,12 @@ fn extract_internal(
     }
 
     let (_, _, threshold, _motion_hull_bounds, threshold_raw_shapes, motion_hull_shape) =
-        get_threshold_outside_motion(motion_shapes, radial_smoothed.as_ref()).unwrap_or((
+        get_threshold_outside_motion(
+            motion_shapes,
+            radial_smoothed.as_ref(),
+            min_accumulator.as_ref(),
+        )
+        .unwrap_or((
             0.0,
             0.0,
             0.0, // Should use previous frames threshold!
@@ -447,7 +497,52 @@ fn extract_internal(
                 analysis_result.has_body = true;
                 body_shape = merge_shapes(body_shape, solid_shapes);
                 // Fill vertical cracks in body
+
+                #[cfg(feature = "output-mask-shapes")]
+                {
+                    let mut raw_shape = RawShape::new();
+                    for span in &body_shape.inner {
+                        let y = span.y as usize;
+
+                        if let Some(spans) = &mut raw_shape.inner[y] {
+                            spans[0].x0 = u8::min(spans[0].x0, span.x0);
+                            spans[0].x1 = u8::max(spans[0].x1, span.x1);
+                        } else {
+                            raw_shape.add_span(span.clone());
+                        }
+                    }
+                    for row in &raw_shape.inner {
+                        if let Some(row) = row {
+                            let y = row[0].y as usize;
+                            for x in row[0].x0..row[0].x1 {
+                                mask[(x as usize, y)] |= 1 << 3;
+                            }
+                        }
+                    }
+                }
                 fill_vertical_cracks(&mut body_shape);
+                #[cfg(feature = "output-mask-shapes")]
+                {
+                    let mut raw_shape = RawShape::new();
+                    for span in &body_shape.inner {
+                        let y = span.y as usize;
+
+                        if let Some(spans) = &mut raw_shape.inner[y] {
+                            spans[0].x0 = u8::min(spans[0].x0, span.x0);
+                            spans[0].x1 = u8::max(spans[0].x1, span.x1);
+                        } else {
+                            raw_shape.add_span(span.clone());
+                        }
+                    }
+                    for row in &raw_shape.inner {
+                        if let Some(row) = row {
+                            let y = row[0].y as usize;
+                            for x in row[0].x0..row[0].x1 {
+                                mask[(x as usize, y)] |= 1 << 2;
+                            }
+                        }
+                    }
+                }
 
                 {
                     // If any shapes that border an edge have chips out of them along that edge, fill the chips.
@@ -503,6 +598,8 @@ fn extract_internal(
                         row.x1 = u8::min(WIDTH as u8, row.x1);
                     }
                 }
+
+                // Another way of doing this would be to look at vertical slices from left to right, and find the major discontinuities there.
 
                 let approx_head_width = guess_approx_head_width(body_shape.clone());
 
@@ -646,8 +743,8 @@ fn extract_internal(
                                 // FIXME(jon): Isn't it really the centroid of the *hull* we want,
                                 //  not of the individual shapes that make it up?
                                 raw_face.push_back(shape);
-                                //}
                             }
+                            //}
                         }
                     }
 
@@ -741,8 +838,13 @@ fn extract_internal(
 
                     // Take an area of the shape to search within for a neck: the narrowest part, taking
                     // into account some skewing factor
+                    info!(
+                        "#{}, looking for neck with approx head width {}",
+                        get_frame_num(),
+                        approx_head_width
+                    );
                     let neck = get_neck(&body_shape, approx_head_width);
-
+                    info!("#{}: Neck {:?}", get_frame_num(), neck);
                     // Probably only when there is very low motion in the scene, since that implies we've lost our good head lock.
                     // Also only when the previous head was fully inside the frame.
                     // Refine the threshold data above the neck:
@@ -772,9 +874,12 @@ fn extract_internal(
                     if face_info.head.area() > 300.0 {
                         //info!("#{} area: {}", get_frame_num(), face_info.head.area());
                         analysis_result.face = face_info;
+                    } else {
+                        info!("#{} Head too small?", get_frame_num());
                     }
 
                     if neck_is_too_close_to_edge_of_frame {
+                        info!("#{} neck too close to edge", get_frame_num());
                         // Output the body shape without the head isolated
                         clear_body_shape();
                         BODY_SHAPE.with(|arr_ref| {
@@ -802,6 +907,20 @@ fn extract_internal(
                         }
                     });
                 }
+
+                // extend_shape_to_bottom(&mut body_shape, 0);
+                //
+                // BODY_AREA_THIS_FRAME.with(|a| a.set(body_shape.area()));
+                // // Output the body shape without the head.
+                // clear_body_shape();
+                // BODY_SHAPE.with(|arr_ref| {
+                //     let mut body_outline = arr_ref.borrow_mut();
+                //     for span in &body_shape.inner {
+                //         body_outline.push(span.y);
+                //         body_outline.push(span.x0);
+                //         body_outline.push(span.x1);
+                //     }
+                // });
             }
         }
     }
@@ -1040,6 +1159,28 @@ fn subtract_frame(
         *px = 0;
     }
 
+    let five_seconds_passed_without_motion = false;
+    // If it's the first frame received, lets initialise the "min buffer"
+    if is_first_frame_received || five_seconds_passed_without_motion {
+        IMAGE_BUFFERS.with(|buffers| {
+            let mut min_buffer = buffers.min_accumulator.borrow_mut();
+            let mut min_buffer = min_buffer.as_mut();
+            min_buffer
+                .buf_mut()
+                .copy_from_slice(curr_radial_smoothed.buf());
+        });
+    } else {
+        // IMAGE_BUFFERS.with(|buffers| {
+        //     let mut min_buffer = buffers.min_accumulator.borrow_mut();
+        //     let mut min_buffer = min_buffer.as_mut();
+        //     for (dest, src) in min_buffer.pixels_mut().zip(curr_radial_smoothed.pixels()) {
+        //         if src < *dest {
+        //             *dest = *dest + ((src - *dest) * 0.005);
+        //         }
+        //     }
+        // });
+    }
+
     // NOTE: If it's the very first frame, don't accumulate motion since it will be all motion.
     if !is_first_frame_received {
         MOTION_BUFFER.with(|buffer| {
@@ -1066,7 +1207,7 @@ fn subtract_frame(
                                 // Don't get motion from the top row, it's probably noise
                                 if index > 120 {
                                     motion_for_current_frame += 1;
-                                    MOTION_BIT
+                                    0u8 //MOTION_BIT
                                 } else {
                                     0u8
                                 }
@@ -1086,7 +1227,35 @@ fn subtract_frame(
             buffer.accumulate_into_slice(mask);
 
             {
+                let _p = Perf::new("Subtract min buffer");
+                IMAGE_BUFFERS.with(|buffers| {
+                    let min_buffer = buffers.min_accumulator.borrow();
+                    let min_buffer = min_buffer.as_ref();
+                    for (index, ((dest, min), src)) in mask
+                        .iter_mut()
+                        .zip(min_buffer.pixels())
+                        .zip(curr_radial_smoothed.pixels())
+                        .enumerate()
+                    {
+                        const LOWER_BOUND: f32 = 30.0;
+                        const UPPER_BOUND: f32 = 50.0;
+                        let x = index % WIDTH;
+                        let is_in_thermal_ref = x >= thermal_ref_rect.x0 && x < thermal_ref_rect.x1;
+                        if !is_in_thermal_ref
+                            && (min - src > LOWER_BOUND || src - min > UPPER_BOUND)
+                        {
+                            *dest |= BACKGROUND_BIT;
+                            *dest |= MOTION_BIT;
+                        }
+                    }
+                });
+            }
+
+            {
                 let _p = Perf::new("Get motion shapes");
+
+                // TODO(jon): Discard shapes that are too small, or have no wide dynamic range.
+
                 motion_shapes = get_raw_shapes(mask, MOTION_BIT);
 
                 // Remove any small motion shapes that are at the top of the frame:
@@ -1811,6 +1980,7 @@ pub fn distance_sq(a: &[u8], b: &[u8]) -> f64 {
 }
 
 fn fill_vertical_cracks(shape: &mut SolidShape) {
+    // TODO(jon): Do a separate pass to get rid of single pixel inclusions.
     let crack_search_threshold = 5;
     if shape.len() > 1 {
         {
@@ -1831,7 +2001,6 @@ fn fill_vertical_cracks(shape: &mut SolidShape) {
         }
 
         {
-            // TODO(jon): Do a better job of filling some gaps in small meeting room frames 992 - 1034
             let mut x0_breaks = Vec::new();
             let mut x1_breaks = Vec::new();
             // Look for discontinuities in x0 and x1 of spans.
@@ -1840,7 +2009,6 @@ fn fill_vertical_cracks(shape: &mut SolidShape) {
                 let b = pair[1];
                 if (a.x0 as i8 - b.x0 as i8) < -1 {
                     // Seems like a break, find the next row that has an x0 within 5 of us, and join to that.
-
                     x0_breaks.push(a.y);
                 }
                 if (a.x1 as i8 - b.x1 as i8) > 1 {
@@ -1849,45 +2017,45 @@ fn fill_vertical_cracks(shape: &mut SolidShape) {
             }
 
             let start_y = shape.inner[0].y as usize;
-            for b in x0_breaks {
-                let break_start_index = b as usize - start_y;
+            for b in x0_breaks.iter().rev() {
+                let break_start_index = *b as usize - start_y;
                 let break_start = shape.inner[break_start_index];
                 let break_end = shape
                     .inner
                     .iter()
                     .enumerate()
                     .skip(break_start_index + 1)
-                    .find(|(_, other)| {
-                        other.x0 as i8 - break_start.x0 as i8 <= crack_search_threshold
+                    .find(|(other_index, other)| {
+                        let y_offset = other_index - break_start_index;
+                        other.x0 <= break_start.x0 + f32::round(y_offset as f32 / 3.0) as u8
                     });
+
                 if let Some((end_index, break_end)) = break_end {
                     let break_end = break_end.clone();
                     let diff = break_end.x0 as i8 - break_start.x0 as i8;
-
                     let diff_y = ((break_end.y - break_start.y) - 1) as f32;
                     let diff_x = diff as f32;
                     let slope = if diff != 0 { diff_x / diff_y } else { 0.0 };
                     let slope = if slope.is_infinite() { 0.0 } else { slope };
                     let slope = if diff_y == 1.0 { diff as f32 } else { slope };
                     for (i, span_index) in ((break_start_index + 1)..end_index).enumerate() {
-                        shape.inner[span_index].x0 = u8::min(
-                            break_end.x0,
-                            (break_start.x0 as i8 + ((slope * (i + 1) as f32) as i8)) as u8,
-                        );
+                        shape.inner[span_index].x0 =
+                            (break_start.x0 as i8 + ((slope * (i + 1) as f32) as i8)) as u8;
                     }
                 }
                 //Find the break end, then fill the gap.
             }
-            for b in x1_breaks {
-                let break_start_index = b as usize - start_y;
+            for b in x1_breaks.iter().rev() {
+                let break_start_index = *b as usize - start_y;
                 let break_start = shape.inner[break_start_index];
                 let break_end = shape
                     .inner
                     .iter()
                     .enumerate()
                     .skip(break_start_index + 1)
-                    .find(|(_, other)| {
-                        break_start.x1 as i8 - other.x1 as i8 <= crack_search_threshold
+                    .find(|(other_index, other)| {
+                        let y_offset = other_index - break_start_index;
+                        other.x1 >= break_start.x1 - f32::round(y_offset as f32 / 3.0) as u8
                     });
                 if let Some((end_index, break_end)) = break_end {
                     let break_end = break_end.clone();
@@ -1900,10 +2068,8 @@ fn fill_vertical_cracks(shape: &mut SolidShape) {
                     let slope = if diff_y == 0.0 { diff as f32 } else { slope };
 
                     for (i, span_index) in ((break_start_index + 1)..end_index).enumerate() {
-                        shape.inner[span_index].x1 = u8::max(
-                            break_end.x1,
-                            (break_start.x1 as i8 + ((slope * (i + 1) as f32) as i8)) as u8,
-                        );
+                        shape.inner[span_index].x1 =
+                            (break_start.x1 as i8 + ((slope * (i + 1) as f32) as i8)) as u8;
                     }
                 }
             }
